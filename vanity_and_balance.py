@@ -13,6 +13,7 @@ from collections import deque
 import aiohttp
 import concurrent.futures
 from threading import Lock
+import json
 
 cuda.init()
 
@@ -28,6 +29,8 @@ RPC_URLS = [
 
 # Add new configuration from .env
 CHECK_BALANCES = os.getenv("CHECK_BALANCES", "false").lower() == "true"
+if not CHECK_BALANCES:
+    print("🚫 Balance checking is disabled.")
 BALANCE_BATCH_SIZE = int(os.getenv("BALANCE_BATCH_SIZE", "100"))
 SYNC_MODE = os.getenv("SYNC_MODE", "false").lower() == "true"
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))  # Number of addresses to check at once
@@ -40,6 +43,10 @@ rpc_index = 0
 last_balance_check = {"address": None, "balance": None, "rpc": None}
 pending_tasks = []
 MAX_PENDING_TASKS = 10  # Adjust based on your needs
+
+# Add near the top with other globals
+FOUND_FILE = "found_addresses.txt"
+BEST_MATCHES_FILE = "best_matches.json"
 
 
 def get_next_web3():
@@ -111,8 +118,8 @@ def check_single_balance(address, private_key):
                     print(f"Balance: {Web3.from_wei(balance, 'ether')} ETH")
                     print(f"Private key: {private_key}")
                     print(f"{'='*50}\n")
-                    with open("found.txt", "a") as f:
-                        f.write(f"{address} {private_key}\n")
+                    with open(FOUND_FILE, "a") as f:
+                        f.write(f"Address: {address}\nPrivate Key: {private_key}\nBalance: {Web3.from_wei(balance, 'ether')} ETH\n{'='*50}\n")
             return balance
         except Exception as e:
             if "429" in str(e):  # Rate limit error
@@ -213,10 +220,28 @@ async def generate_vanity_address(prefix, num_attempts=0):
                         "address": address,
                         "similarity": similarity,
                         "private_key": priv_key_hex,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
-                    print(
-                        f"🎯 Best match so far: {best_match['address']} ({best_match['similarity']} chars)"
-                    )
+                    print(f"🎯 Best match so far: {best_match['address']} ({best_match['similarity']} chars)")
+                    
+                    # Save to JSON file
+                    try:
+                        # Load existing matches
+                        matches = []
+                        try:
+                            with open(BEST_MATCHES_FILE, 'r') as f:
+                                matches = json.load(f)
+                        except (FileNotFoundError, json.JSONDecodeError):
+                            matches = []
+                        
+                        # Add new match
+                        matches.append(best_match)
+                        
+                        # Save updated matches
+                        with open(BEST_MATCHES_FILE, 'w') as f:
+                            json.dump(matches, f, indent=2)
+                    except Exception as e:
+                        print(f"❌ Error saving best match: {str(e)}")
                     # Immediately check for balance if best match without waiting
                     ethBalance = check_single_balance(address, priv_key_hex)
                     print(f"💰 Balance: {ethBalance} ETH")
@@ -385,8 +410,8 @@ async def batch_check_balances(addresses, private_keys):
                             print(f"Balance: {Web3.from_wei(balance, 'ether')} ETH")
                             print(f"Private key: {private_key}")
                             print(f"{'='*50}\n")
-                            with open("found.txt", "a") as f:
-                                f.write(f"{address} {private_key}\n")
+                            with open(FOUND_FILE, "a") as f:
+                                f.write(f"Address: {address}\nPrivate Key: {private_key}\nBalance: {Web3.from_wei(balance, 'ether')} ETH\n{'='*50}\n")
 
             return results
 
@@ -488,9 +513,12 @@ async def main():
 
 if __name__ == "__main__":
     SUPPORTED_SIZES = []
-    for url in RPC_URLS:
-        SUPPORTED_SIZES.append(asyncio.run(determine_optimal_batch_size(url)))
-    BALANCE_BATCH_SIZE = min(SUPPORTED_SIZES)
-    print(f"🎯 Using safe batch size of {BALANCE_BATCH_SIZE} for all RPCs\n")
+    if CHECK_BALANCES:
+        for url in RPC_URLS:
+            SUPPORTED_SIZES.append(asyncio.run(determine_optimal_batch_size(url)))
+        BALANCE_BATCH_SIZE = min(SUPPORTED_SIZES)
+        print(f"🎯 Using safe batch size of {BALANCE_BATCH_SIZE} for all RPCs\n")
+    else:
+        print("🚫 Balance checking is disabled.")
 
     asyncio.run(main())
