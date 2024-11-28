@@ -31,12 +31,15 @@ CHECK_BALANCES = os.getenv("CHECK_BALANCES", "false").lower() == "true"
 BALANCE_BATCH_SIZE = int(os.getenv("BALANCE_BATCH_SIZE", "100"))
 SYNC_MODE = os.getenv("SYNC_MODE", "false").lower() == "true"
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))  # Number of addresses to check at once
+total_balance_checks = 0
 
 # Create a round-robin RPC selector
 rpc_index = 0
 
 # Add near the top after other global variables
 last_balance_check = {"address": None, "balance": None, "rpc": None}
+pending_tasks = []
+MAX_PENDING_TASKS = 10  # Adjust based on your needs
 
 
 def get_next_web3():
@@ -98,7 +101,7 @@ def check_single_balance(address, private_key):
             last_balance_check = {
                 "address": address,
                 "balance": Web3.from_wei(balance, "ether"),
-                "rpc": web3.provider.endpoint_uri
+                "rpc": web3.provider.endpoint_uri,
             }
             if balance > 0:
                 with print_lock:
@@ -114,13 +117,17 @@ def check_single_balance(address, private_key):
         except Exception as e:
             if "429" in str(e):  # Rate limit error
                 with print_lock:
-                    print(f"⚠️  Rate limit hit on {web3.provider.endpoint_uri}: {str(e)}")
+                    print(
+                        f"⚠️  Rate limit hit on {web3.provider.endpoint_uri}: {str(e)}"
+                    )
                 time.sleep(1)  # Back off a bit
             else:
                 with print_lock:
-                    print(f"⚠️  Error on {web3.provider.endpoint_uri}, trying next RPC: {str(e)}")
+                    print(
+                        f"⚠️  Error on {web3.provider.endpoint_uri}, trying next RPC: {str(e)}"
+                    )
             continue
-    
+
     with print_lock:
         print(f"❌ All RPCs failed to check balance for {address}")
     return None
@@ -165,13 +172,7 @@ async def generate_vanity_address(prefix, num_attempts=0):
     prefixes_checked = 0
     best_match = {"address": None, "similarity": 0, "private_key": None}
     last_status_time = time.time()
-    total_balance_checks = 0
     active_checks = 0
-
-    def check_callback(future):
-        nonlocal active_checks, total_balance_checks
-        active_checks -= 1
-        total_balance_checks += 1
 
     address_batch = []
     private_key_batch = []
@@ -223,17 +224,24 @@ async def generate_vanity_address(prefix, num_attempts=0):
                 if CHECK_BALANCES:
                     address_batch.append(address)
                     private_key_batch.append(priv_key_hex)
-                    if len(address_batch) >= BATCH_SIZE:
-                        # Schedule balance check without awaiting
-                        asyncio.create_task(
+                    if len(address_batch) >= BALANCE_BATCH_SIZE:
+                        # Create task without waiting
+                        task = asyncio.create_task(
                             batch_check_balances(
                                 address_batch.copy(), private_key_batch.copy()
                             )
                         )
+                        pending_tasks.append(task)
+                        active_checks += 1
+
+                        # Process completed tasks without blocking
+                        await process_pending_tasks()
+
                         address_batch.clear()
                         private_key_batch.clear()
 
             except Exception as e:
+                print(f"❌ Error generating address: {str(e)}")
                 continue
 
             # Status update every 10 seconds
@@ -249,24 +257,30 @@ async def generate_vanity_address(prefix, num_attempts=0):
                 print(f"⚡ Speed: {speed:,.2f} addr/s")
                 print(f"🚀 Prefix check speed: {prefix_speed:,.2f} prefixes/s")
                 if CHECK_BALANCES:
-                    print(f"💰 Balance checks queued: {len(address_batch)}")
                     print(f"✓ Total balance checks: {total_balance_checks:,}")
                     if last_balance_check["address"]:
-                        print(
-                            f"📊 Last check: {last_balance_check['address']} - {last_balance_check['balance']} ETH"
-                        )
-                print(
-                    f"🎯 Best match so far: {best_match['address']} ({best_match['similarity']} chars)"
-                )
+                        print(f"📊 Last check: {last_balance_check['address']} - {last_balance_check['balance']} ETH")
+                print(f"🎯 Best match so far: {best_match['address']} ({best_match['similarity']} chars)")
                 print(f"{'='*72}\n")
                 last_status_time = current_time
-            
-            prefixes_checked += 1 # we checked a key
+
+            prefixes_checked += 1  # we checked a key
+
+        # Process any remaining addresses in the batch
+        if CHECK_BALANCES and address_batch:
+            future = asyncio.create_task(
+                batch_check_balances(address_batch.copy(), private_key_batch.copy())
+            )
+            active_checks += 1
 
         # Only break if num_attempts is positive
         if num_attempts > 0 and total_attempts >= num_attempts:
             print(f"\n⚠️ Reached maximum attempts: {num_attempts:,}")
             break
+
+    # Process any remaining tasks before exiting
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks)
 
     return None, None
 
@@ -327,6 +341,8 @@ def calculate_similarity(address, prefix):
 
 async def batch_check_balances(addresses, private_keys):
     """Check multiple balances in a single RPC call with failover"""
+    global total_balance_checks
+    
     for _ in range(len(RPC_URLS)):  # Try each RPC once
         try:
             web3 = get_next_web3()
@@ -337,26 +353,30 @@ async def batch_check_balances(addresses, private_keys):
                     "jsonrpc": "2.0",
                     "method": "eth_getBalance",
                     "params": [addr, "latest"],
-                    "id": i
+                    "id": i,
                 }
                 for i, addr in enumerate(addresses)
             ]
 
             async with aiohttp.ClientSession() as session:
-                async with session.post(web3.provider.endpoint_uri, json=payload) as response:
+                async with session.post(
+                    web3.provider.endpoint_uri, json=payload
+                ) as response:
                     results = await response.json()
 
             # Process results
             for result, address, private_key in zip(results, addresses, private_keys):
                 if "result" in result:
+                    total_balance_checks += 1
                     balance = int(result["result"], 16)  # Convert hex to int
                     # Update last balance check info
                     global last_balance_check
                     last_balance_check = {
                         "address": address,
                         "balance": Web3.from_wei(balance, "ether"),
-                        "rpc": web3.provider.endpoint_uri
+                        "rpc": web3.provider.endpoint_uri,
                     }
+                    # print(f"📊 Updated last_balance_check: {last_balance_check}")
                     if balance > 0:
                         with print_lock:
                             print(f"\n{'='*50}")
@@ -372,16 +392,18 @@ async def batch_check_balances(addresses, private_keys):
 
         except Exception as e:
             if "429" in str(e):  # Rate limit error
-                with print_lock:
-                    print(f"⚠️  Rate limit hit on {web3.provider.endpoint_uri}: {str(e)}")
-                time.sleep(1)  # Back off a bit
+                continue  # skip this rpc for now
             else:
                 with print_lock:
-                    print(f"⚠️  Batch check error on {web3.provider.endpoint_uri}, trying next RPC: {str(e)}")
+                    print(
+                        f"⚠️  Batch check error on {web3.provider.endpoint_uri}, trying next RPC: {str(e)}"
+                    )
             continue
 
     with print_lock:
-        print(f"❌ All RPCs failed for batch balance check of {len(addresses)} addresses")
+        print(
+            f"❌ All RPCs failed for batch balance check of {len(addresses)} addresses"
+        )
     return None
 
 
@@ -421,6 +443,28 @@ async def determine_optimal_batch_size(rpc_url):
 
     print(f"ℹ️ Using conservative batch size: {optimal_size}")
     return optimal_size
+
+
+async def process_pending_tasks():
+    """Process completed tasks and remove them from the pending list"""
+    global pending_tasks
+
+    # Only process completed tasks
+    done_tasks = [task for task in pending_tasks if task.done()]
+    for task in done_tasks:
+        try:
+            result = await task
+            if result:
+                # Process result if needed
+                pass
+        except Exception as e:
+            print(f"❌ Task failed: {str(e)}")
+        pending_tasks.remove(task)
+
+    # If we have too many pending tasks, wait for some to complete
+    if len(pending_tasks) >= MAX_PENDING_TASKS:
+        if pending_tasks:
+            await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
 
 
 async def main():
